@@ -1,0 +1,5 @@
+*.sif
+*.tar
+*.tar.gz
+__pycache__/
+tokenizers/

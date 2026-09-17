@@ -1,0 +1,25 @@
+# scandbox-pi from existing harness-pi---fast rebuild, extracts the compiled
+# pi binary. Strips the baked-in user and makes the image portable.
+#
+# Build context = scandbox-podman/harnesses/ :
+#   podman build -t scandbox-pi -f harnesses/pi/Dockerfile.from-base harnesses/
+
+FROM harness-pi AS source
+
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl jq git ca-certificates ripgrep bash \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=source /usr/local/bin/pi /usr/local/bin/pi
+COPY --from=source /usr/local/bin/theme /usr/local/bin/theme
+
+RUN mkdir -p /home/user
+
+COPY entrypoint.sh /usr/local/bin/scandbox-entrypoint
+COPY pi/harness.json /etc/scandbox/harness.json
+RUN mkdir -p /etc/scandbox && \
+    chmod 0755 /usr/local/bin/scandbox-entrypoint && \
+    chmod 0644 /etc/scandbox/harness.json
+
+ENTRYPOINT ["/usr/local/bin/scandbox-entrypoint"]

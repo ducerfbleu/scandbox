@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# netns-run---run a command in a rootless, AIRGAPPED network namespace whose only
+# reachable destination is the host loopback (where the scandbox recorder listens).
+#
+#   netns-run -- <command...>
+#
+# How (all rootless, no CNI, no setuid):
+#   1. unshare a new user+net namespace (unpriv userns).
+#   2. attach slirp4netns as a userspace uplink---host 127.0.0.1 is reachable from the ns at
+#      10.0.2.2 (slirp's default host-loopback), DNS disabled.
+#   3. DELETE the default route inside the ns -> the ONLY reachable dest is host loopback
+#      (the recorder). Internet is route-blocked (proven: dest=external has no route).
+#   4. exec <command...> in the ns.
+#
+# Requires on PATH: unshare, ip, slirp4netns (e.g. `conda activate apptainer-net`).
+# Point the agent at the recorder via 10.0.2.2 (scandbox-run sets --recorder-host 10.0.2.2
+# for --netns). Route-only airgap exposes all host-loopback ports at 10.0.2.2; add an nft
+# port-allowlist later if the LLM is ever on host loopback.
+set -uo pipefail
+
+[ "${1:-}" = "--" ] && shift
+[ "$#" -gt 0 ] || { echo "usage: netns-run -- <command...>" >&2; exit 2; }
+command -v slirp4netns >/dev/null 2>&1 || {
+  echo "netns-run: slirp4netns not on PATH---'conda activate apptainer-net' (or install it)" >&2; exit 3; }
+command -v unshare >/dev/null 2>&1 || { echo "netns-run: 'unshare' not found (util-linux)" >&2; exit 3; }
+
+TMPD="$(mktemp -d)"
+SLIRP_PID=""
+cleanup() { [ -n "$SLIRP_PID" ] && kill "$SLIRP_PID" 2>/dev/null; rm -rf "$TMPD"; }
+trap cleanup EXIT INT TERM
+
+echo "netns-run: airgapped netns (slirp4netns; recorder at 10.0.2.2, internet blocked, DNS off)" >&2
+
+# Attach slirp in the BACKGROUND so the agent can run in the FOREGROUND and keep the controlling
+# TTY. (If the agent is backgrounded, bash gives it /dev/null stdin -> --shell's `bash -i` reads
+# EOF and exits instantly without you typing anything.) The bg waiter reads the child's netns pid,
+# then configures the tap.
+(
+  for _ in $(seq 1 200); do [ -s "$TMPD/nspid" ] && break; sleep 0.05; done
+  cpid="$(cat "$TMPD/nspid" 2>/dev/null || true)"
+  [ -n "$cpid" ] || exit 0
+  exec slirp4netns --configure --disable-dns "$cpid" tap0 >"$TMPD/slirp.log" 2>&1
+) &
+SLIRP_PID=$!
+
+# FOREGROUND: the agent's netns. Publish our pid (for slirp), wait for slirp to configure tap0,
+# drop the default route (the airgap), then exec the agent WITH the TTY attached.
+unshare --user --map-root --net bash -c '
+  echo "$$" > "'"$TMPD"'/nspid"
+  for _ in $(seq 1 200); do
+    ip route show default 2>/dev/null | grep -q "^default" && break
+    sleep 0.05
+  done
+  for _ in $(seq 1 20); do
+    ip route del default 2>/dev/null || true
+    ip route show default 2>/dev/null | grep -q "^default" || break
+    sleep 0.1
+  done
+  ip route show default 2>/dev/null | grep -q "^default" \
+    && echo "netns-run: WARNING: default route still present---NOT airgapped" >&2
+  exec "$@"
+' _ "$@"
+rc=$?
+[ "$rc" -ne 0 ] && [ -s "$TMPD/slirp.log" ] && { echo "netns-run: slirp4netns log:" >&2; cat "$TMPD/slirp.log" >&2; }
+exit "$rc"

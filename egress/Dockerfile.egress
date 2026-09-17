@@ -1,0 +1,12 @@
+# scandbox-egress---stdlib Go allow-list CONNECT proxy (plane 2).
+# Static build -> scratch. The same binary runs as a docker container OR a host process
+# (bin/scandbox-egress, extracted by build.sh for apptainer), like the recorder.
+FROM golang:1.22-alpine AS build
+WORKDIR /src
+COPY go.mod .
+COPY egress.go .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /scandbox-egress .
+
+FROM scratch
+COPY --from=build /scandbox-egress /scandbox-egress
+ENTRYPOINT ["/scandbox-egress"]

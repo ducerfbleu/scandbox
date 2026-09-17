@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""scandbox-run — unified launcher for all scandbox runtimes.
+
+    scandbox-run --runtime <docker|podman|apptainer|kata> --agent <IMAGE|SIF> --llm <URL>
+                 [--work DIR] [--gpu nvidia] [--egress gh,pypi] [--shell] [--dry-run]
+                 [-- <agent command...>]
+
+The recorder (scandbox-gateway) is runtime-agnostic: same hash-chained provenance
+regardless of whether the agent runs in Docker, Podman, Apptainer, or Kata.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from recorder import EGRESS_DOMAINS, DEFAULT_AUDIT_ROOT, resolve_agent
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Record an agent session through the scandbox L7 recorder.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  # Podman (rootless, shared GPU):
+  scandbox-run --runtime podman --agent pi --llm http://127.0.0.1:8014 --work ./work -p "task"
+  # Docker (key custody):
+  scandbox-run --runtime docker --agent pi --llm https://api.anthropic.com --api anthropic \\
+    --llm-key-file ~/.scandbox/claude.key --work ./work -p "task"
+  # Apptainer (HPC, enforced airgap):
+  scandbox-run --runtime apptainer --agent scandbox-pi.sif --llm http://127.0.0.1:8080 \\
+    --netns --work ./work -p "task"
+  # Kata (hypervisor isolation):
+  scandbox-run --runtime kata --agent pi --llm http://127.0.0.1:8014 --work ./work -p "task"
+""")
+
+    p.add_argument("--runtime", required=True, choices=["docker", "podman", "apptainer", "kata"],
+                   help="container runtime for the agent")
+    p.add_argument("--agent", required=True, metavar="IMAGE",
+                   help="agent image (catalog: pi, pi-cuda) or raw name/path")
+    p.add_argument("--llm", required=True, metavar="URL",
+                   help="endpoint of the already-running LLM")
+    p.add_argument("--api", choices=["openai", "anthropic", "llama"], default="openai",
+                   help="dialect hint recorded in the index")
+
+    p.add_argument("--work", nargs="+", action="extend", default=[], metavar="DIR")
+    p.add_argument("--work-ro", nargs="+", action="extend", default=[], metavar="DIR")
+    p.add_argument("--data", nargs="+", action="extend", default=[], metavar="DIR")
+    p.add_argument("--data-rw", nargs="+", action="extend", default=[], metavar="DIR")
+    p.add_argument("--mount", action="append", default=[], metavar="HOST:CTR[:ro]",
+                   help="extra bind mount (repeatable)")
+
+    p.add_argument("--egress", metavar="GROUPS",
+                   help=f"web via allow-list — {sorted(EGRESS_DOMAINS)} or 'all'")
+    p.add_argument("--gpu", choices=["nvidia", "intel", "both"], default=None)
+
+    p.add_argument("--llm-verify", action="store_true")
+    p.add_argument("--llm-key", metavar="KEY", default=None)
+    p.add_argument("--llm-key-file", metavar="PATH", default=None,
+                   help="file holding the upstream API key (recommended)")
+    p.add_argument("--llm-key-env", metavar="VAR", default=None,
+                   help="env var holding the upstream API key")
+    p.add_argument("--llm-net", metavar="NET", default=None,
+                   help="docker/podman network the recorder joins to reach --llm")
+
+    p.add_argument("--recorder-name", metavar="NAME", default="llm-gateway")
+    p.add_argument("--as-root", action="store_true")
+    p.add_argument("--shell", action="store_true",
+                   help="self-wire, then drop into an interactive shell")
+    p.add_argument("--no-hash", action="store_true")
+    p.add_argument("--audit-root", default=str(DEFAULT_AUDIT_ROOT))
+    p.add_argument("--run-id", default=None)
+    p.add_argument("-p", "--prompt", metavar="TEXT", default=None)
+    p.add_argument("--dry-run", action="store_true")
+
+    # apptainer-specific
+    p.add_argument("--netns", action="store_true",
+                   help="(apptainer) run in rootless network namespace (enforced airgap)")
+    p.add_argument("--recorder-host", metavar="HOST", default=None)
+    p.add_argument("--port", type=int, default=None)
+
+    # podman-specific
+    p.add_argument("--wire", metavar="PROFILE", default=None,
+                   help="(podman) self-wire an un-catalogued image at runtime")
+    p.add_argument("--manifest", metavar="FILE", default=None,
+                   help="(podman) custom harness.json for runtime wiring")
+
+    p.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <agent command...>")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    args.agent = resolve_agent(args.agent)
+
+    if args.runtime == "docker":
+        from runtimes.docker import run
+    elif args.runtime == "podman":
+        from runtimes.podman import run
+    elif args.runtime == "apptainer":
+        from runtimes.apptainer import run
+    elif args.runtime == "kata":
+        from runtimes.kata import run
+    else:
+        sys.exit(f"unknown runtime: {args.runtime}")
+
+    sys.exit(run(args))
+
+
+if __name__ == "__main__":
+    main()

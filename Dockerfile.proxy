@@ -1,0 +1,10 @@
+# scandbox-egress-proxy — the ONLY scandbox container that touches the bridge.
+# squid allowlist proxy for plane 2 (agent web egress). The squid.conf is generated
+# by run-harness from the --egress groups and bind-mounted at /etc/squid/squid.conf,
+# so allowlist changes need no rebuild.
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    squid ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+EXPOSE 3128
+CMD ["squid", "-N", "-f", "/etc/squid/squid.conf"]

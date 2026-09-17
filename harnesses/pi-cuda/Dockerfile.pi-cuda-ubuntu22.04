@@ -1,0 +1,53 @@
+# scandbox-pi-cuda (pi agent, Ubuntu 22.04) — pi baked as a native binary on CUDA 12.8 / Ubuntu 22.04,
+# wired exactly like scandbox-pi. Stage 1 bun-compiles a standalone `pi`; stage 2 is the CUDA
+# runtime (22.04) with `pi` on PATH + the shared self-wiring entrypoint (writes ~/.pi/agent/models.json
+# pointed at the recorder, then runs `pi --provider llamacpp --model <detected>`).
+#
+# DL stack (torch/JAX) is NOT baked — bring it via a mounted conda (`--mount /opt/miniconda3:...`);
+# this image supplies CUDA 12.8.
+#
+# Build from the pi-agent repo ROOT (the context must contain pi-build/):
+#   docker build -f scandbox-docker/harnesses/pi-cuda/Dockerfile.pi-cuda-ubuntu22.04 -t scandbox-pi-cuda .
+
+# --- Stage 1: compile the standalone pi binary (disposable) ---
+FROM node:22-bookworm-slim AS compile
+RUN npm install -g bun
+COPY pi-build /build
+WORKDIR /build/packages/coding-agent
+RUN bun build --compile --no-compile-autoload-bunfig \
+    ./dist/bun/cli.js ./src/utils/image-resize-worker.ts \
+    --outfile /pi
+
+# --- Stage 2: CUDA runtime (Ubuntu 22.04) with native pi + scandbox wiring ---
+FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl jq git ca-certificates ripgrep make \
+    && rm -rf /var/lib/apt/lists/*
+
+# CUDA toolkit libs (from base) + the runtime-mounted driver dir, resolvable by SONAME
+# (libcuda.so.1 lands in /opt/nvidia-driver via `scandbox-run --gpu nvidia`).
+RUN printf '/usr/local/cuda/lib64\n/opt/nvidia-driver\n' > /etc/ld.so.conf.d/scandbox-cuda.conf && ldconfig
+
+# native pi (bun-compiled, self-contained — no node at runtime) + its TUI theme assets
+COPY --from=compile /pi /usr/local/bin/pi
+COPY --from=compile /build/packages/coding-agent/dist/modes/interactive/theme /usr/local/bin/theme
+
+# uid 1000 -> home /home/dev0 (scandbox-run uses --user $(id -u):$(id -g) + HOME=<host home>)
+ARG USER_HOME=/home/dev0
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN if id -nu ${USER_UID} >/dev/null 2>&1; then \
+      usermod -d ${USER_HOME} -l user "$(id -nu ${USER_UID})"; \
+    else \
+      groupadd -g ${USER_GID} user && \
+      useradd -u ${USER_UID} -g ${USER_GID} -d ${USER_HOME} -s /bin/bash -M user; \
+    fi \
+    && mkdir -p ${USER_HOME}/.pi/agent ${USER_HOME}/.local/bin ${USER_HOME}/.cache \
+    && chown -R ${USER_UID}:${USER_GID} ${USER_HOME}
+
+# shared self-wiring entrypoint + pi manifest
+COPY scandbox-docker/harnesses/entrypoint.sh /usr/local/bin/scandbox-entrypoint
+COPY scandbox-docker/harnesses/pi-cuda/harness.json /etc/scandbox/harness.json
+RUN chmod 0755 /usr/local/bin/scandbox-entrypoint && chmod 0644 /etc/scandbox/harness.json
+ENTRYPOINT ["/usr/local/bin/scandbox-entrypoint"]
