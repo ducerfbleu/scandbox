@@ -1,0 +1,5 @@
+{
+  "api": "llama",
+  "command": ["pi", "--provider", "llamacpp"],
+  "model_config": "pi_models_json"
+}

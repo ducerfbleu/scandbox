@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+"""scandbox-run (podman)---record an agent session through the L7 recorder.
+
+    scandbox-run --agent <image> --llm <url>
+                 [--work DIR] [--work-ro DIR] [--data DIR] [--egress gh,pypi]
+                 [--gpu nvidia] [--llm-key KEY] [--llm-verify]
+                 [--shell] [--dry-run] [-- <agent command...>]
+
+Podman-only variant. The recorder is a container, dual-homed on an --internal airgap
+network (agent side) and the default podman network (LLM side, via pasta). The agent
+is single-homed on the airgap network---structural isolation, rootless, no daemon.
+
+The LLM is already running; --llm is its endpoint. scandbox never touches the LLM's
+networking---only the recorder gets a route to it. Standard library only.
+"""
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+D = {
+    "gateway_image": "scandbox-gateway",
+    "egress_image": "scandbox-egress",
+    "airgap_net": "scandbox-airgap",
+    "egress_net": "scandbox-net",
+    "gateway_name": "scandbox-gw",
+    "egress_name": "scandbox-egress-proxy",
+    "port": 8080,
+    "audit_root": HOME / ".local" / "state" / "scandbox",
+}
+
+EGRESS_DOMAINS = {
+    "gh": ["github.com", "api.github.com", "objects.githubusercontent.com", "raw.githubusercontent.com"],
+    "hf": ["huggingface.co", "hf.co"],
+    "pypi": ["pypi.org", "files.pythonhosted.org"],
+}
+
+AGENTS = {
+    "pi": {"image": "scandbox-pi"},
+    "pi-cuda": {"image": "scandbox-pi-cuda"},
+}
+
+WIRE = {
+    "pi": {"model_config": "pi_models_json", "command": ["pi", "--provider", "llamacpp"]},
+}
+
+
+def die(m):
+    print(f"error: {m}", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve_dir(p, label):
+    d = Path(p).expanduser().resolve()
+    if not d.is_dir():
+        die(f"{label} '{p}' is not a directory")
+    return d
+
+
+# ---- podman helpers ----------------------------------------------------------
+
+def podman(*args, check=True, capture=False):
+    cmd = ["podman"] + list(args)
+    if capture:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        return r
+    return subprocess.run(cmd, check=check)
+
+
+def image_exists(name):
+    return podman("image", "exists", name, check=False).returncode == 0
+
+
+def ensure_net(name, internal=True):
+    r = podman("network", "inspect", name, check=False, capture=True)
+    if r.returncode != 0:
+        cmd = ["network", "create"] + (["--internal"] if internal else []) + [name]
+        podman(*cmd)
+        print(f"created network: {name}")
+
+
+def net_connect(net, ctr):
+    podman("network", "connect", net, ctr, check=False, capture=True)
+
+
+def rm_container(name):
+    podman("rm", "-f", name, check=False, capture=True)
+
+
+def container_ip(name, network):
+    r = podman("inspect", name, "--format", "{{json .NetworkSettings.Networks}}", capture=True)
+    if r.returncode != 0:
+        return None
+    import json as _json
+    nets = _json.loads(r.stdout)
+    return nets.get(network, {}).get("IPAddress")
+
+
+def image_digest(name):
+    r = podman("inspect", "--format", "{{.Id}}", name, capture=True)
+    img_id = r.stdout.strip() if r.returncode == 0 else None
+    r2 = podman("inspect", "--format", "{{range .RepoDigests}}{{.}} {{end}}", name, capture=True)
+    toks = r2.stdout.split() if r2.returncode == 0 else []
+    return img_id, (toks[0] if toks else None)
+
+
+def check_wire_deps(image):
+    probe = ('m=; for t in jq curl bash; do command -v "$t" >/dev/null 2>&1 || m="$m $t"; done; printf %s "$m"')
+    r = subprocess.run(["podman", "run", "--rm", "--entrypoint", "/bin/sh", image, "-c", probe],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return ["<no /bin/sh---need bash, jq, curl>"]
+    return r.stdout.split()
+
+
+# ---- provenance: plane-3 filesystem manifest ---------------------------------
+
+def manifest(dirs, do_hash=True, cap=50 * 1024 * 1024):
+    out = {}
+    for d in dirs:
+        base = Path(d)
+        if not base.exists():
+            continue
+        for f in base.rglob("*"):
+            if not f.is_file() or f.is_symlink():
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            rec = {"size": st.st_size, "mtime": int(st.st_mtime)}
+            if do_hash and st.st_size <= cap:
+                try:
+                    h = hashlib.sha256()
+                    with open(f, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            h.update(chunk)
+                    rec["sha256"] = h.hexdigest()
+                except OSError:
+                    pass
+            out[str(f)] = rec
+    return out
+
+
+def manifest_diff(before, after):
+    ch = []
+    for p, a in after.items():
+        b = before.get(p)
+        if b is None:
+            ch.append({"path": p, "status": "created", "sha256": a.get("sha256"), "size": a["size"]})
+        elif b.get("sha256") != a.get("sha256") or b["size"] != a["size"]:
+            ch.append({"path": p, "status": "modified",
+                       "sha256_before": b.get("sha256"), "sha256_after": a.get("sha256")})
+    for p, b in before.items():
+        if p not in after:
+            ch.append({"path": p, "status": "deleted", "sha256_before": b.get("sha256")})
+    return ch
+
+
+# ---- egress (plane 2) -------------------------------------------------------
+
+def egress_for(groups):
+    if not groups:
+        return []
+    req = [g.strip() for g in groups.split(",") if g.strip()]
+    if "all" in req:
+        req = list(EGRESS_DOMAINS)
+    bad = [g for g in req if g not in EGRESS_DOMAINS]
+    if bad:
+        die(f"unknown egress groups: {', '.join(bad)}; have: {', '.join(EGRESS_DOMAINS)}")
+    out = []
+    for g in req:
+        out += EGRESS_DOMAINS[g]
+    return out
+
+
+# ---- agent wiring ------------------------------------------------------------
+
+def recorder_env(host, port, key=None):
+    base = f"http://{host}:{port}"
+    k = key or "scandbox"
+    env = {
+        "PI_OFFLINE": "1", "LLAMA_HOST": host, "LLAMA_PORT": str(port),
+        "OPENAI_BASE_URL": f"{base}/v1", "OPENAI_API_BASE": f"{base}/v1", "OPENAI_API_KEY": k,
+        "ANTHROPIC_BASE_URL": base, "ANTHROPIC_API_KEY": k,
+    }
+    if key:
+        env["LLAMA_API_KEY"] = key
+    return env
+
+
+def gpu_args(kind):
+    args, env = [], []
+    if kind in ("nvidia", "both"):
+        for dev in ("/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-uvm"):
+            if Path(dev).exists():
+                args += ["--device", dev]
+        libdir = "/usr/lib/x86_64-linux-gnu"
+        for so in ("libcuda.so.1", "libnvidia-ml.so.1", "libnvidia-ptxjitcompiler.so.1"):
+            src = os.path.realpath(os.path.join(libdir, so))
+            if os.path.isfile(src):
+                args += ["-v", f"{src}:/opt/nvidia-driver/{so}:ro"]
+        env += ["-e", "LD_LIBRARY_PATH=/opt/nvidia-driver:/usr/local/cuda/lib64"]
+    if kind in ("intel", "both"):
+        for dev in ("/dev/dri/renderD128", "/dev/dri/card0"):
+            if Path(dev).exists():
+                args += ["--device", dev]
+        env += ["-e", "UR_LOADER_USE_LEVEL_ZERO_V2=0"]
+    return args, env
+
+
+# ---- provenance index --------------------------------------------------------
+
+def write_index(audit_dir, run_id, args, upstream, work, egress, rc, started,
+                agent_digest=None, agent_repo=None, status="completed"):
+    plane1 = audit_dir / "plane1.jsonl"
+    plane2 = audit_dir / "access.log"
+    chain_head, chain_len, _last = "", 0, ""
+    if plane1.exists():
+        with open(plane1) as _f:
+            for _line in _f:
+                if _line.strip():
+                    chain_len += 1
+                    _last = _line
+        if _last:
+            try:
+                chain_head = json.loads(_last).get("record_hash", "")
+            except (ValueError, TypeError):
+                pass
+    idx = {
+        "run_id": run_id, "runtime": "podman", "status": status, "agent": args.agent,
+        "agent_image_digest": agent_digest, "agent_repo_digest": agent_repo,
+        "api": args.api, "llm": upstream, "egress": args.egress or "none",
+        "started": int(started), "ended": None if status == "running" else int(time.time()), "exit_code": rc,
+        "work": [[str(p), m] for p, m in work],
+        "planes": {"llm_log": str(plane1), "egress_log": str(plane2),
+                   "fs_manifest": str(audit_dir / "plane3.json")},
+        "counts": {
+            "llm_records": chain_len,
+            "egress_lines": sum(1 for _ in open(plane2)) if plane2.exists() else 0,
+        },
+        "chain": {"head": chain_head, "len": chain_len},
+    }
+    (audit_dir / "index.json").write_text(json.dumps(idx, indent=2))
+    return idx
+
+
+# ---- podman runtime ----------------------------------------------------------
+
+def run_podman(args, agent_cmd, audit_dir, run_id, upstream, verify, work, data, write_dirs, egress):
+    gw = args.recorder_name
+    port = D["port"]
+    airgap = D["airgap_net"]
+
+    # --- recorder (dual-homed: airgap + default podman network) ---
+    gw_env = {
+        "GATEWAY_LISTEN": f":{port}", "GATEWAY_UPSTREAM": upstream,
+        "GATEWAY_TLS_VERIFY": "1" if verify else "0",
+        "GATEWAY_LOG": "/logs/plane1.jsonl", "GATEWAY_RUN_ID": run_id,
+    }
+    gw_cmd = ["podman", "run", "-d", "--name", D["gateway_name"], "--network", airgap,
+              "-v", f"{audit_dir}:/logs"]
+    for k, v in gw_env.items():
+        gw_cmd += ["-e", f"{k}={v}"]
+    gw_cmd.append(D["gateway_image"])
+
+    # --- agent ---
+    # --userns=keep-id maps the calling user's UID/GID into the container (no baked-in user needed).
+    # An ephemeral per-run home is mounted so ~/.pi/agent/models.json lives there, not in the image.
+    run_home = audit_dir / "home"
+    aenv = recorder_env(gw, port, args.llm_key)
+    agent_name = f"scandbox-agent-{run_id[:12]}"
+    create = ["podman", "create", "--rm", "-i", "--name", agent_name, "--network", airgap,
+              "--userns=keep-id"]
+    if sys.stdin.isatty():
+        create.append("-t")
+    if args.as_root:
+        create += ["--user", "0:0"]
+    create += ["-v", f"{run_home}:/home/user", "-e", "HOME=/home/user"]
+    for k, v in aenv.items():
+        create += ["-e", f"{k}={v}"]
+
+    # egress: Go allow-list proxy (dual-homed: egress-net + default)
+    egr_name = D["egress_name"]
+    if egress:
+        ensure_net(D["egress_net"], internal=True)
+
+    if args.shell:
+        create += ["-e", "SCANDBOX_SHELL=1"]
+    for p, m in work:
+        create += ["-v", f"{p}:{p}" + (":ro" if m == "ro" else "")]
+    for p, m in data:
+        create += ["-v", f"{p}:{p}" + (":ro" if m == "ro" else "")]
+    for spec in args.mount:
+        parts = spec.split(":")
+        if len(parts) < 2:
+            die(f"--mount must be HOST:CONTAINER[:ro], got '{spec}'")
+        parts[0] = str(Path(parts[0]).expanduser().resolve())
+        create += ["-v", ":".join(parts)]
+    if args.gpu:
+        ga, ge = gpu_args(args.gpu)
+        create += ga + ge
+
+    # runtime-inject self-wiring: mount the shared entrypoint + a manifest and override the image's
+    # entrypoint, so an un-catalogued image wires exactly like a catalogued harness---no rebuild.
+    ep_src = manifest_src = None
+    if args.wire or args.manifest:
+        ep_src = SCRIPT_DIR / "harnesses" / "entrypoint.sh"
+        if not ep_src.is_file():
+            die(f"runtime wiring: shared entrypoint not found at {ep_src}")
+        if args.manifest:
+            manifest_src = Path(args.manifest).expanduser().resolve()
+            if not manifest_src.is_file():
+                die(f"--manifest not found: {manifest_src}")
+        else:
+            if args.wire not in WIRE:
+                die(f"unknown --wire profile '{args.wire}' (have: {', '.join(WIRE)})")
+            manifest_src = audit_dir / "harness.json"
+        create += ["-v", f"{ep_src}:/scandbox/entrypoint:ro",
+                   "-v", f"{manifest_src}:/scandbox/harness.json:ro",
+                   "-e", "SCANDBOX_MANIFEST=/scandbox/harness.json"]
+
+    create += ["-w", str(work[0][0]) if work else "/workspace", args.agent]
+
+    uses_our_ep = args.catalogued or bool(args.wire or args.manifest)
+    if args.shell and not uses_our_ep:
+        import shlex
+        create += ["bash"]
+        if agent_cmd:
+            print("  --shell: in the shell, launch the agent with:  "
+                  + " ".join(shlex.quote(c) for c in agent_cmd))
+    else:
+        if ep_src:
+            create += ["/scandbox/entrypoint"]
+        if agent_cmd:
+            create += agent_cmd
+
+    if args.dry_run:
+        import shlex
+        print("# recorder (dual-homed: %s + podman default):\n  %s" % (airgap, " ".join(shlex.quote(c) for c in gw_cmd)))
+        print("  podman network connect podman %s" % D["gateway_name"])
+        if egress:
+            print(f"# egress: podman run -d --name {egr_name} --network {D['egress_net']} + podman  ({len(egress)} domains)")
+        if manifest_src:
+            src = f"--manifest {manifest_src}" if args.manifest else f"profile '{args.wire}' -> {manifest_src}"
+            print(f"# wiring (runtime-inject): mount {ep_src} + manifest ({src}); run /scandbox/entrypoint "
+                  "AS the command, composed with the image's own entrypoint")
+        print("# agent (airgap only, --add-host for recorder):\n  " + " ".join(shlex.quote(c) for c in create))
+        return 0
+
+    # --- preflight ---
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    run_home.mkdir(parents=True, exist_ok=True)
+    if args.wire and not args.manifest:
+        prof = WIRE[args.wire]
+        (audit_dir / "harness.json").write_text(json.dumps(
+            {"model_config": prof["model_config"], "command": prof["command"]}, indent=2))
+    if not image_exists(args.agent):
+        die(f"agent image '{args.agent}' not found---run: docker save {args.agent} | podman load")
+    if args.wire or args.manifest:
+        missing = check_wire_deps(args.agent)
+        if missing:
+            die("runtime wiring (--wire/--manifest) runs the shared entrypoint inside the agent "
+                f"image, which needs jq + curl + bash---'{args.agent}' is missing:{' '.join(missing)}.\n"
+                "  install them in the image (add to its Dockerfile), then rebuild:\n"
+                "    RUN apt-get update && apt-get install -y jq curl bash    # Debian/Ubuntu\n"
+                "    RUN apk add --no-cache jq curl bash                      # Alpine")
+    if not image_exists(D["gateway_image"]):
+        die(f"recorder image '{D['gateway_image']}' not found---run ./build.sh")
+
+    img_id, repo = image_digest(args.agent)
+    print(f"agent: {args.agent}  digest={img_id}")
+
+    # --- start recorder ---
+    ensure_net(airgap, internal=True)
+    rm_container(D["gateway_name"])
+    subprocess.run(gw_cmd, check=True, capture_output=True)
+    net_connect("podman", D["gateway_name"])
+
+    # wait for recorder to get an IP on the airgap network
+    gw_ip = None
+    for _ in range(20):
+        gw_ip = container_ip(D["gateway_name"], airgap)
+        if gw_ip:
+            break
+        time.sleep(0.3)
+    if not gw_ip:
+        r = podman("logs", D["gateway_name"], capture=True)
+        die(f"recorder has no IP on {airgap}---logs:\n{r.stdout}\n{r.stderr}")
+
+    # verify recorder is running (can't connect to container IPs from the host in rootless podman)
+    time.sleep(0.5)
+    r = podman("inspect", D["gateway_name"], "--format", "{{.State.Running}}", capture=True)
+    if r.stdout.strip() != "true":
+        r = podman("logs", D["gateway_name"], capture=True)
+        die(f"recorder exited---logs:\n{r.stdout}\n{r.stderr}")
+
+    print(f"recorder: {D['gateway_name']} at {gw_ip} (dual-homed: {airgap} + podman)")
+
+    # --- start egress proxy ---
+    if egress:
+        if not image_exists(D["egress_image"]):
+            die(f"egress image '{D['egress_image']}' not found---run ./build.sh")
+        rm_container(egr_name)
+        egr_port = port + 1
+        subprocess.run([
+            "podman", "run", "-d", "--name", egr_name, "--network", D["egress_net"],
+            "-e", f"EGRESS_LISTEN=:{egr_port}",
+            "-e", f"EGRESS_ALLOW={','.join(egress)}",
+            "-e", "EGRESS_PORTS=443,80",
+            "-e", f"EGRESS_LOG=/logs/access.log",
+            "-v", f"{audit_dir}:/logs",
+            D["egress_image"],
+        ], check=True, capture_output=True)
+        net_connect("podman", egr_name)
+        egr_ip = None
+        for _ in range(20):
+            egr_ip = container_ip(egr_name, D["egress_net"])
+            if egr_ip:
+                break
+            time.sleep(0.3)
+        if egr_ip:
+            purl = f"http://{egr_ip}:{egr_port}"
+            for v in ("HTTPS_PROXY", "https_proxy"):
+                create += ["-e", f"{v}={purl}"]
+            noproxy = f"{gw_ip},127.0.0.1,localhost"
+            for v in ("NO_PROXY", "no_proxy"):
+                create += ["-e", f"{v}={noproxy}"]
+            # agent also needs the egress net
+            net_connect(D["egress_net"], agent_name)
+            print(f"egress: {egr_name} at {egr_ip} ({len(egress)} domains)")
+
+    # inject the recorder IP into the agent via --add-host (no DNS needed)
+    # insert before the image name
+    img_idx = create.index(args.agent)
+    create.insert(img_idx, f"{gw}:{gw_ip}")
+    create.insert(img_idx, "--add-host")
+
+    # --- run ---
+    before = manifest(write_dirs, do_hash=not args.no_hash)
+    started = time.time()
+    write_index(audit_dir, run_id, args, upstream, work, egress, None, started,
+                agent_digest=img_id, agent_repo=repo, status="running")
+    print(f"  shell in: podman exec -it {agent_name} bash")
+
+    cid = subprocess.run(create, capture_output=True, text=True, check=True).stdout.strip()
+    if egress:
+        net_connect(D["egress_net"], cid)
+
+    rc, status = None, "interrupted"
+    try:
+        rc = subprocess.run(["podman", "start", "-a", "-i", cid]).returncode
+        status = "completed"
+    finally:
+        after = manifest(write_dirs, do_hash=not args.no_hash)
+        (audit_dir / "plane3.json").write_text(json.dumps(
+            {"run_id": run_id, "write_dirs": write_dirs, "changes": manifest_diff(before, after)}, indent=2))
+        idx = write_index(audit_dir, run_id, args, upstream, work, egress, rc, started,
+                          agent_digest=img_id, agent_repo=repo, status=status)
+        rm_container(D["gateway_name"])
+        if egress:
+            rm_container(egr_name)
+    print(f"\nprovenance: {audit_dir}/index.json  ({idx['counts']['llm_records']} llm records, {status})")
+    return rc
+
+
+# ---- cli ---------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Record an agent session through the L7 recorder (podman, rootless).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  # catalogued harness (turnkey, self-wiring); LLM on docker bridge:
+  scandbox-run --agent pi --llm https://172.17.0.2:8080 -p "fix the failing test"
+  # interactive shell (self-wire, then bash---Ctrl+Z suspends the agent):
+  scandbox-run --agent pi --llm https://172.17.0.2:8080 --work . --shell
+  # BYO image, runtime-wired as pi (needs jq+curl+bash in the image):
+  scandbox-run --agent my-pi-image --wire pi --llm https://172.17.0.2:8080 -p "fix it"
+  # BYO image with a custom manifest:
+  scandbox-run --agent my-image --manifest harness.json --llm https://172.17.0.2:8080 -p "fix it"
+  # dry run (print the plan, do nothing):
+  scandbox-run --agent pi --llm https://172.17.0.2:8080 --dry-run
+  # with web egress:
+  scandbox-run --agent pi --llm https://172.17.0.2:8080 --egress gh,pypi -p "fix it"
+  # bring-your-own image:
+  scandbox-run --agent my-image --llm http://host.containers.internal:8014 -- aider --yes
+""")
+    p.add_argument("--agent", required=True, metavar="IMAGE", help="podman/docker image to run + record")
+    p.add_argument("--wire", metavar="PROFILE", default=None,
+                   help=f"self-wire an un-catalogued image at runtime via a built-in profile "
+                        f"({', '.join(WIRE)})---mounts the shared entrypoint (needs jq+curl+bash in the image)")
+    p.add_argument("--manifest", metavar="FILE", default=None,
+                   help="mount a custom harness.json for runtime wiring (overrides --wire)")
+    p.add_argument("--mount", action="append", default=[], metavar="HOST:CTR[:ro]",
+                   help="extra bind mount (repeatable; e.g. ~/pi-build:/opt/pi:ro)")
+    p.add_argument("--llm", required=True, metavar="URL", help="endpoint of the already-running LLM")
+    p.add_argument("--api", choices=["openai", "anthropic", "llama"], default="openai",
+                   help="dialect hint recorded in the index")
+    p.add_argument("--work", nargs="+", action="extend", default=[], metavar="DIR", help="working dirs (rw)")
+    p.add_argument("--work-ro", nargs="+", action="extend", default=[], metavar="DIR", help="working dirs (ro)")
+    p.add_argument("--data", nargs="+", action="extend", default=[], metavar="DIR", help="data dirs (ro)")
+    p.add_argument("--data-rw", nargs="+", action="extend", default=[], metavar="DIR", help="data dirs (rw)")
+    p.add_argument("--egress", metavar="GROUPS", help=f"web via proxy---{sorted(EGRESS_DOMAINS)} or 'all'")
+    p.add_argument("--gpu", choices=["intel", "nvidia", "both"],
+                   help="GPU passthrough---explicit devices + driver libs")
+    p.add_argument("--llm-verify", action="store_true", help="verify upstream TLS (default: off)")
+    p.add_argument("--llm-key", metavar="KEY", default=None,
+                   help="LLM API key---sent through the recorder to --llm")
+    p.add_argument("--recorder-name", metavar="NAME", default="llm-gateway",
+                   help="agent-facing recorder hostname (default: llm-gateway)")
+    p.add_argument("--as-root", action="store_true", help="run the agent as root (default: current user)")
+    p.add_argument("--shell", action="store_true",
+                   help="self-wire, then drop into an interactive shell")
+    p.add_argument("--no-hash", action="store_true", help="plane-3 manifest: size+mtime only")
+    p.add_argument("--audit-root", default=str(D["audit_root"]), help="where run logs go")
+    p.add_argument("--run-id", default=None, help="override the generated run id")
+    p.add_argument("-p", "--prompt", metavar="TEXT", default=None,
+                   help="non-interactive prompt, appended as -p TEXT")
+    p.add_argument("--dry-run", action="store_true", help="print the plan, do nothing")
+    p.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <agent command...>")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    agent_cmd = list(args.cmd)
+    if agent_cmd and agent_cmd[0] == "--":
+        agent_cmd = agent_cmd[1:]
+    if args.prompt:
+        agent_cmd += ["-p", args.prompt]
+
+    entry = AGENTS.get(args.agent)
+    args.catalogued = entry is not None
+    if entry:
+        args.agent = entry["image"]
+
+    run_id = args.run_id or uuid.uuid4().hex[:16]
+    audit_dir = Path(args.audit_root).expanduser() / run_id
+    work = [(resolve_dir(w, "--work"), "rw") for w in args.work]
+    work += [(resolve_dir(w, "--work-ro"), "ro") for w in args.work_ro]
+    data = [(resolve_dir(d, "--data"), "ro") for d in args.data]
+    data += [(resolve_dir(d, "--data-rw"), "rw") for d in args.data_rw]
+    write_dirs = [str(p) for p, m in work if m == "rw"]
+    write_dirs += [str(p) for p, m in data if m == "rw"]
+    upstream = args.llm
+    verify = args.llm_verify
+    egress = egress_for(args.egress)
+
+    print(f"scandbox-run: podman | agent={args.agent} | llm={upstream} | api={args.api} | "
+          f"egress={args.egress or 'none'}")
+    print(f"  run_id: {run_id}\n  audit:  {audit_dir}")
+
+    rc = run_podman(args, agent_cmd, audit_dir, run_id, upstream, verify, work, data, write_dirs, egress)
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()

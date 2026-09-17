@@ -1,0 +1,497 @@
+#!/usr/bin/env python3
+"""scandbox-run (apptainer / HPC)---record a pi agent session through the L7 recorder.
+
+    scandbox-run --agent <file.sif> --llm <url> [--api openai|anthropic|llama]
+                 [--llm-key KEY] [--llm-verify] [--netns] [--egress gh,pypi]
+                 [--work DIR] [--work-ro DIR] [--data DIR] [--data-rw DIR]
+                 [--dry-run] [-- <agent command...>]
+
+The LLM is already running; --llm is its endpoint. The recorder (scandbox-gateway) runs as a
+host process on 127.0.0.1 and writes a hash-chained plane1.jsonl of every exchange---that
+capture is the whole point. Only the recorder dials --llm; the SIF agent is pointed at the
+recorder and never reaches the LLM directly. With --netns the agent runs in a rootless,
+route-blocked network namespace whose only reachable dest is the recorder (ENFORCED airgap);
+without --netns the airgap is POLICY only (Apptainer shares the host net)---see the run-time note.
+
+Rootless, no daemon; standard library only. HPC/benchmark carve-out of scandbox (docker path removed).
+"""
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+HOME = Path.home()
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+D = {
+    "gateway_bin": str(SCRIPT_DIR / "bin" / "scandbox-gateway"),
+    "egress_bin": str(SCRIPT_DIR / "bin" / "scandbox-egress"),
+    "port": 8080,
+    "audit_root": HOME / ".local" / "state" / "scandbox",
+}
+
+EGRESS_DOMAINS = {
+    "gh": ["github.com", "api.github.com", "objects.githubusercontent.com", "raw.githubusercontent.com"],
+    "hf": ["huggingface.co", "hf.co"],
+    "pypi": ["pypi.org", "files.pythonhosted.org"],
+}
+
+
+def die(m):
+    print(f"error: {m}", file=sys.stderr)
+    sys.exit(1)
+
+
+def resolve_dir(p, label):
+    d = Path(p).expanduser().resolve()
+    if not d.is_dir():
+        die(f"{label} '{p}' is not a directory")
+    return d
+
+
+def parse_mount(spec):
+    """Parse HOST:CONTAINER[:ro] → (host_path, container_path, mode).
+    A bare path (no colon, or single Windows-like drive letter) is rejected —
+    --mount always requires an explicit container path; use --work/--data for identity mounts."""
+    parts = spec.split(":")
+    if len(parts) == 2:
+        host, ctr = parts
+        mode = "rw"
+    elif len(parts) == 3:
+        host, ctr, mode = parts
+        if mode not in ("ro", "rw"):
+            die(f"--mount '{spec}': mode must be 'ro' or 'rw', got '{mode}'")
+    else:
+        die(f"--mount '{spec}': expected HOST:CONTAINER[:ro|rw]")
+    if not ctr.startswith("/"):
+        die(f"--mount '{spec}': container path must be absolute")
+    host_dir = resolve_dir(host, "--mount")
+    return (host_dir, Path(ctr), mode)
+
+
+# ---- provenance: plane-3 filesystem manifest -------------------------------
+
+def manifest(dirs, do_hash=True, cap=50 * 1024 * 1024):
+    out = {}
+    for d in dirs:
+        base = Path(d)
+        if not base.exists():
+            continue
+        for f in base.rglob("*"):
+            if not f.is_file() or f.is_symlink():
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            rec = {"size": st.st_size, "mtime": int(st.st_mtime)}
+            if do_hash and st.st_size <= cap:
+                try:
+                    h = hashlib.sha256()
+                    with open(f, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            h.update(chunk)
+                    rec["sha256"] = h.hexdigest()
+                except OSError:
+                    pass
+            out[str(f)] = rec
+    return out
+
+
+def manifest_diff(before, after):
+    ch = []
+    for p, a in after.items():
+        b = before.get(p)
+        if b is None:
+            ch.append({"path": p, "status": "created", "sha256": a.get("sha256"), "size": a["size"]})
+        elif b.get("sha256") != a.get("sha256") or b["size"] != a["size"]:
+            ch.append({"path": p, "status": "modified",
+                       "sha256_before": b.get("sha256"), "sha256_after": a.get("sha256")})
+    for p, b in before.items():
+        if p not in after:
+            ch.append({"path": p, "status": "deleted", "sha256_before": b.get("sha256")})
+    return ch
+
+
+# ---- egress allow-list (plane 2) -------------------------------------------
+
+def egress_for(groups):
+    if not groups:
+        return []
+    req = [g.strip() for g in groups.split(",") if g.strip()]
+    if "all" in req:
+        req = list(EGRESS_DOMAINS)
+    bad = [g for g in req if g not in EGRESS_DOMAINS]
+    if bad:
+        die(f"unknown egress groups: {', '.join(bad)}; have: {', '.join(EGRESS_DOMAINS)}")
+    out = []
+    for g in req:
+        out += EGRESS_DOMAINS[g]
+    return out
+
+
+# ---- agent wiring ----------------------------------------------------------
+
+def recorder_env(host, port, key=None):
+    """All recorder base-URL envs---the self-wiring harness (SIF runscript) selects which it needs.
+    `key` (--llm-key) is what the agent sends, via the recorder, to the upstream LLM."""
+    base = f"http://{host}:{port}"
+    k = key or "scandbox"
+    env = {
+        "PI_OFFLINE": "1", "LLAMA_HOST": host, "LLAMA_PORT": str(port),
+        "OPENAI_BASE_URL": f"{base}/v1", "OPENAI_API_BASE": f"{base}/v1", "OPENAI_API_KEY": k,
+        "ANTHROPIC_BASE_URL": base, "ANTHROPIC_API_KEY": k,
+    }
+    if key:
+        env["LLAMA_API_KEY"] = key
+    return env
+
+
+# ---- provenance index ------------------------------------------------------
+
+def write_index(audit_dir, run_id, runtime, args, upstream, work, mounts, egress, rc, started,
+                sif_sha256=None, signature=None, status="completed"):
+    plane1 = audit_dir / "plane1.jsonl"
+    plane2 = audit_dir / "access.log"
+    # chain anchor: the tip (last record_hash) + record count, so `gateway -verify` can detect a
+    # truncated tail---the hash chain alone can't (a chopped suffix is still self-consistent).
+    chain_head, chain_len, _last = "", 0, ""
+    if plane1.exists():
+        with open(plane1) as _f:
+            for _line in _f:
+                if _line.strip():
+                    chain_len += 1
+                    _last = _line
+        if _last:
+            try:
+                chain_head = json.loads(_last).get("record_hash", "")
+            except (ValueError, TypeError):
+                pass
+    idx = {
+        "run_id": run_id, "runtime": runtime, "status": status, "agent": args.agent,
+        "sif_sha256": sif_sha256, "signature": signature, "api": args.api,
+        "llm": upstream, "egress": args.egress or "none",
+        "started": int(started), "ended": None if status == "running" else int(time.time()), "exit_code": rc,
+        "work": [[str(p), m] for p, m in work],
+        "mounts": [[str(h), str(c), m] for h, c, m in (mounts or [])],
+        "planes": {"llm_log": str(plane1), "egress_log": str(plane2),
+                   "fs_manifest": str(audit_dir / "plane3.json")},
+        "counts": {
+            "llm_records": chain_len,
+            "egress_lines": sum(1 for _ in open(plane2)) if plane2.exists() else 0,
+        },
+        "chain": {"head": chain_head, "len": chain_len},
+    }
+    (audit_dir / "index.json").write_text(json.dumps(idx, indent=2))
+    return idx
+
+
+# ---- apptainer runtime (HPC) -----------------------------------------------
+
+def sif_provenance(sif_path):
+    """(sha256, signature) for a .sif. signature = {status, signer, detail};
+    `verify` needs apptainer, else status='unknown'."""
+    sha = None
+    try:
+        h = hashlib.sha256()
+        with open(sif_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        sha = h.hexdigest()
+    except OSError:
+        pass
+    return sha, _sif_verify(sif_path)
+
+
+def _sif_verify(sif_path):
+    """apptainer verify -> {status: verified|unsigned|unverified|unknown, signer, detail}."""
+    if not _have("apptainer"):
+        return {"status": "unknown", "signer": None, "detail": "apptainer not on PATH"}
+    r = subprocess.run(["apptainer", "verify", str(sif_path)], capture_output=True, text=True)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode == 0:
+        signer = None
+        for line in out.splitlines():
+            s = line.strip()
+            low = s.lower()
+            if low.startswith("signing entity"):
+                signer = s.split(":", 1)[1].strip()
+            elif low.startswith("fingerprint") and not signer:
+                signer = s.split(":", 1)[1].strip()
+        return {"status": "verified", "signer": signer, "detail": out[:2000]}
+    low = out.lower()
+    unsigned = any(t in low for t in ("signature not found", "no signatures", "no signature",
+                                      "not signed", "no objects"))
+    return {"status": "unsigned" if unsigned else "unverified", "signer": None, "detail": out[:2000]}
+
+
+def run_apptainer(args, agent_cmd, audit_dir, run_id, upstream, verify, work, data, mounts, write_dirs, egress):
+    binp = D["gateway_bin"]
+    port = args.port
+    listen_host = "127.0.0.1"  # recorder always on host loopback; slirp maps it to 10.0.2.2 inside the netns
+    reach_host = args.recorder_host or ("10.0.2.2" if args.netns else "127.0.0.1")
+
+    rec_env = {
+        "GATEWAY_LISTEN": f"{listen_host}:{port}", "GATEWAY_UPSTREAM": upstream,
+        "GATEWAY_TLS_VERIFY": "1" if verify else "0",
+        "GATEWAY_LOG": str(audit_dir / "plane1.jsonl"), "GATEWAY_RUN_ID": run_id,
+    }
+    aenv = recorder_env(reach_host, port, args.llm_key)
+    # HPC site proxies (http_proxy/https_proxy) leak into the container even with apptainer --cleanenv, so pi
+    # routes its recorder call through the site squid -> "(111) connection refused". The agent only ever talks
+    # to the LOCAL recorder, so clear them + never-proxy the recorder host (the --egress block re-sets HTTPS_PROXY).
+    for v in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        aenv[v] = ""
+    aenv["NO_PROXY"] = aenv["no_proxy"] = f"{reach_host},127.0.0.1,localhost"
+
+    egr_port = port + 1                                  # egress proxy: host loopback, recorder port + 1
+    egr_bin = D["egress_bin"]
+    if egress:  # route the agent's web tools through the allow-list proxy (a 2nd host-loopback door)
+        purl = f"http://{reach_host}:{egr_port}"
+        # scandbox-egress is CONNECT-only, so ONLY set HTTPS_PROXY: external HTTPS tunnels via the
+        # proxy, while the recorder (plain HTTP on loopback) stays DIRECT---leaving HTTP_PROXY unset
+        # avoids routing the /props probe + pi's LLM calls through the proxy (which would 405, so pi
+        # falls back to "model"/ctx 4096). Robust even if the agent's HTTP client ignores NO_PROXY.
+        for v in ("HTTPS_PROXY", "https_proxy"):
+            aenv[v] = purl
+        noproxy = f"{reach_host},127.0.0.1,localhost"   # extra safety for clients that do honor it
+        for v in ("NO_PROXY", "no_proxy"):
+            aenv[v] = noproxy
+
+    run_home = audit_dir / "home"         # isolated, ephemeral HOME---keeps the agent's ~/.pi off the host home
+    run_scratch = audit_dir / "scratch"   # --contain backs the container's /tmp + /var/tmp HERE, not host /tmp
+    # Always `apptainer run`---the runscript IS the self-wiring entrypoint; `apptainer exec`/`shell`
+    # would BYPASS it (no models.json wiring, and args like `-p PROMPT` get exec'd as a binary).
+    # --contain: private /tmp,/var/tmp (backed by --workdir) + minimal /dev, and NO default bind of
+    # host $HOME/$PWD---so the agent sees ONLY the explicit --work/--data binds. (Apptainer still
+    # shares the host NETWORK unless --netns; see the note.)
+    if args.shell:   # self-wire, then drop to an interactive shell in the sandbox (the SIF entrypoint honors this)
+        aenv = {**aenv, "SCANDBOX_SHELL": "1"}
+    app = ["apptainer", "run", "--contain", "--cleanenv",
+           "--workdir", str(run_scratch), "--home", f"{run_home}:{HOME}"]
+    if args.gpu == "nvidia":
+        # apptainer's NVIDIA hook: binds the host driver (libcuda/nvml) + /dev/nvidia* into the SIF;
+        # the CUDA toolkit (nvcc/cudart) comes from the SIF. Composes with --contain and --netns
+        # (GPU is local; the netns only blocks network). Needs a CUDA-capable SIF (scandbox-pi-cuda.sif).
+        app += ["--nv"]
+    if work:
+        app += ["--pwd", str(work[0][0])]   # land in the first work dir
+    for k, v in aenv.items():
+        app += ["--env", f"{k}={v}"]
+    for p, m in work:
+        app += ["--bind", f"{p}:{p}" + (":ro" if m == "ro" else "")]
+    for p, m in data:
+        app += ["--bind", f"{p}:{p}" + (":ro" if m == "ro" else "")]
+    for host, ctr, m in mounts:
+        app += ["--bind", f"{host}:{ctr}" + (":ro" if m == "ro" else "")]
+    app += [args.agent]
+    app += agent_cmd   # runscript args (e.g. -p PROMPT); the self-wiring entrypoint execs the agent + "$@"
+    if args.netns:
+        # enforce the airgap: run the whole apptainer invocation inside a rootless, route-blocked
+        # netns (unshare + slirp4netns) whose only reachable dest is the recorder at 10.0.2.2.
+        app = [str(SCRIPT_DIR / "netns-run"), "--"] + app
+
+    if args.dry_run:
+        envs = " ".join(f"{k}={v}" for k, v in rec_env.items())
+        print(f"# recorder (host process):\n  {envs} {binp}")
+        if egress:
+            print(f"# egress proxy (host process):\n  EGRESS_LISTEN=127.0.0.1:{egr_port} "
+                  f"EGRESS_ALLOW={','.join(egress)} EGRESS_LOG={audit_dir}/access.log {egr_bin}")
+        print("# agent:\n  " + " ".join(app))
+        _apptainer_policy_note(args)
+        return 0
+
+    if not Path(binp).exists():
+        die(f"recorder binary not found: {binp}\n"
+            f"  build it on a docker host (or `cd gateway && CGO_ENABLED=0 go build -o ../bin/scandbox-gateway .`).")
+    if not _have("apptainer"):
+        die("apptainer not found on PATH")
+    if args.agent.endswith(".sif") and not Path(args.agent).exists():
+        die(f"SIF not found: {args.agent}")
+    if egress and not Path(egr_bin).exists():
+        die(f"egress proxy binary not found: {egr_bin}---build egress/ (CGO_ENABLED=0 go build -o ../bin/scandbox-egress .)")
+
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    run_home.mkdir(parents=True, exist_ok=True)
+    run_scratch.mkdir(parents=True, exist_ok=True)
+
+    sif_sha, sig = sif_provenance(args.agent) if Path(args.agent).is_file() else (None, None)
+    if sif_sha:
+        print(f"agent: {args.agent}  sif_sha256={sif_sha}")
+        if sig and sig["status"] == "verified":
+            print(f"  SIF verified (signer: {sig['signer']})")
+        else:
+            st = sig["status"] if sig else "unknown"
+            print(f"warning: SIF signature {st}---supply chain not verified; sign + "
+                  f"`apptainer verify` before a trusted run", file=sys.stderr)
+    _apptainer_policy_note(args)
+    reclog = open(audit_dir / "recorder.log", "w")
+    rec = subprocess.Popen([binp], env={**os.environ, **rec_env}, stdout=reclog, stderr=subprocess.STDOUT)
+    egr_proc, egr_log = None, None
+    if egress:
+        egr_log = open(audit_dir / "egress.log", "w")
+        egr_proc = subprocess.Popen(
+            [egr_bin], stdout=egr_log, stderr=subprocess.STDOUT,
+            env={**os.environ, "EGRESS_LISTEN": f"127.0.0.1:{egr_port}", "EGRESS_ALLOW": ",".join(egress),
+                 "EGRESS_PORTS": "443,80", "EGRESS_LOG": str(audit_dir / "access.log")})
+        print(f"egress: {len(egress)} domains allow-listed via scandbox-egress (127.0.0.1:{egr_port})")
+    started = time.time()
+    before = manifest(write_dirs, do_hash=not args.no_hash)
+    # Write the index NOW (status=running) so an interrupted/killed run is still on record---the
+    # gateway streams plane1.jsonl live, but this summary would otherwise only exist on clean exit.
+    write_index(audit_dir, run_id, "apptainer", args, upstream, work, mounts, None, None, started,
+                sif_sha256=sif_sha, signature=sig, status="running")
+    rc, status = None, "interrupted"
+    try:
+        _wait_port(listen_host, port, timeout=10)  # recorder listens on host loopback (reach_host may be in-netns)
+        if rec.poll() is not None:  # gateway died on start (usually 127.0.0.1:PORT already in use)
+            die(f"recorder exited on start---is 127.0.0.1:{port} already taken (stale gateway)? "
+                f"see {audit_dir}/recorder.log; free the port or pass --port")
+        if egr_proc is not None:
+            _wait_port("127.0.0.1", egr_port, timeout=10)
+            if egr_proc.poll() is not None:
+                die(f"egress proxy exited on start---is 127.0.0.1:{egr_port} taken? see {audit_dir}/egress.log")
+        rc = subprocess.run(app).returncode
+        status = "completed"
+    finally:
+        after = manifest(write_dirs, do_hash=not args.no_hash)
+        (audit_dir / "plane3.json").write_text(json.dumps(
+            {"run_id": run_id, "write_dirs": write_dirs, "changes": manifest_diff(before, after)}, indent=2))
+        idx = write_index(audit_dir, run_id, "apptainer", args, upstream, work, mounts, None, rc, started,
+                          sif_sha256=sif_sha, signature=sig, status=status)
+        rec.terminate()
+        try:
+            rec.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rec.kill()
+        reclog.close()
+        if egr_proc is not None:
+            egr_proc.terminate()
+            try:
+                egr_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                egr_proc.kill()
+            egr_log.close()
+    print(f"\nprovenance: {audit_dir}/index.json  ({idx['counts']['llm_records']} llm records, {status})")
+    return rc
+
+
+def _apptainer_policy_note(args):
+    if args.netns:
+        print("note: --netns → ENFORCED airgap via netns-run (rootless unshare + slirp4netns): the agent\n"
+              "      runs in its own netns with the default route removed, so it reaches ONLY the recorder\n"
+              "      (+ the egress allow-list proxy when --egress)---both host-loopback via 10.0.2.2;\n"
+              "      internet is route-blocked, DNS off. Needs slirp4netns on PATH.",
+              file=sys.stderr)
+    else:
+        print("WARNING: no --netns---Apptainer SHARES THE HOST NETWORK, so the agent HAS FULL INTERNET\n"
+              "         access. The airgap here is POLICY only (the agent is handed the recorder URL,\n"
+              "         never --llm), NOT enforced. For real enforcement use --netns + slirp4netns.\n"
+              "         Filesystem IS contained (--contain: private /tmp, no host $HOME/$PWD; only\n"
+              "         --work/--data are shared).", file=sys.stderr)
+
+
+def _have(prog):
+    return subprocess.run(["sh", "-c", f"command -v {prog}"], capture_output=True).returncode == 0
+
+
+def _wait_port(host, port, timeout=10):
+    import socket
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
+# ---- cli -------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        description="Record a pi agent session through the L7 recorder (apptainer / HPC).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  # shared/broadcast endpoint (URL + key):
+  scandbox-run --agent scandbox-pi.sif --llm https://llm.cluster:8443 --llm-key "$LLM_KEY" --llm-verify \\
+    --netns --work "$PWD/work" -p "solve task X"
+  # self-deployed LLM on this compute node (recorder is a host process, so localhost works):
+  scandbox-run --agent scandbox-pi.sif --llm http://127.0.0.1:8014 --llm-key testkey \\
+    --netns --egress pypi --work "$PWD/work" -p "solve task X"
+""")
+    p.add_argument("--agent", required=True, metavar="SIF", help=".sif to run + record")
+    p.add_argument("--llm", required=True, metavar="URL",
+                   help="endpoint of the already-running LLM (the recorder dials it; the agent never does)")
+    p.add_argument("--api", choices=["openai", "anthropic", "llama"], default="openai",
+                   help="dialect hint recorded in the index")
+    p.add_argument("--work", nargs="+", action="extend", default=[], metavar="DIR", help="working dirs (rw)")
+    p.add_argument("--work-ro", nargs="+", action="extend", default=[], metavar="DIR", help="working dirs (ro)")
+    p.add_argument("--data", nargs="+", action="extend", default=[], metavar="DIR", help="data dirs (ro)")
+    p.add_argument("--data-rw", nargs="+", action="extend", default=[], metavar="DIR", help="data dirs (rw)")
+    p.add_argument("--mount", nargs="+", action="extend", default=[], metavar="HOST:CTR[:ro]",
+                   help="bind HOST dir to a DIFFERENT container path (default rw); e.g. /shared/libs:/opt/libs:ro")
+    p.add_argument("--egress", metavar="GROUPS",
+                   help=f"web via allow-list proxy---{sorted(EGRESS_DOMAINS)} or 'all' (default: none = airgapped)")
+    p.add_argument("--llm-verify", action="store_true",
+                   help="verify upstream TLS (default: off, for self-signed/local)")
+    p.add_argument("--llm-key", metavar="KEY", default=None,
+                   help="LLM API key---the agent sends it through the recorder to --llm")
+    p.add_argument("--netns", action="store_true",
+                   help="run the agent in a rootless network namespace (ENFORCED airgap; needs slirp4netns)")
+    p.add_argument("--recorder-host", metavar="HOST",
+                   help="--netns: address the agent uses to reach the recorder (default 10.0.2.2)")
+    p.add_argument("--gpu", choices=["nvidia"], default=None,
+                   help="NVIDIA GPU passthrough (apptainer --nv); needs a CUDA-capable SIF (e.g. scandbox-pi-cuda.sif)")
+    p.add_argument("--port", type=int, default=D["port"], help=f"recorder listen port (default {D['port']})")
+    p.add_argument("--no-hash", action="store_true", help="plane-3 manifest: size+mtime only (skip sha256)")
+    p.add_argument("--audit-root", default=str(D["audit_root"]), help="where run logs go")
+    p.add_argument("--run-id", default=None, help="override the generated run id")
+    p.add_argument("-p", "--prompt", metavar="TEXT", default=None,
+                   help="non-interactive prompt, appended to the agent command as -p TEXT")
+    p.add_argument("--shell", action="store_true",
+                   help="self-wire, then drop into an interactive shell IN the sandbox (run pi manually; still recorded)")
+    p.add_argument("--dry-run", action="store_true", help="print the plan, do nothing")
+    p.add_argument("cmd", nargs=argparse.REMAINDER, help="-- <agent command...> (else the SIF runscript default)")
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    agent_cmd = list(args.cmd)
+    if agent_cmd and agent_cmd[0] == "--":
+        agent_cmd = agent_cmd[1:]
+    if args.prompt:
+        agent_cmd += ["-p", args.prompt]
+
+    run_id = args.run_id or uuid.uuid4().hex[:16]
+    audit_dir = Path(args.audit_root).expanduser() / run_id
+    work = [(resolve_dir(w, "--work"), "rw") for w in args.work]
+    work += [(resolve_dir(w, "--work-ro"), "ro") for w in args.work_ro]
+    data = [(resolve_dir(d, "--data"), "ro") for d in args.data]
+    data += [(resolve_dir(d, "--data-rw"), "rw") for d in args.data_rw]
+    mounts = [parse_mount(m) for m in args.mount]
+    write_dirs = [str(p) for p, m in work if m == "rw"]
+    write_dirs += [str(p) for p, m in data if m == "rw"]
+    write_dirs += [str(h) for h, _, m in mounts if m == "rw"]
+    upstream = args.llm
+    verify = args.llm_verify
+    egress = egress_for(args.egress)
+
+    print(f"scandbox-run (apptainer/HPC): agent={args.agent} | llm={upstream} | api={args.api} | "
+          f"egress={args.egress or 'none'}")
+    print(f"  run_id: {run_id}\n  audit:  {audit_dir}")
+
+    rc = run_apptainer(args, agent_cmd, audit_dir, run_id, upstream, verify, work, data, mounts, write_dirs, egress)
+    sys.exit(rc)
+
+
+if __name__ == "__main__":
+    main()
